@@ -1,0 +1,11 @@
+# Core Libraries
+python-telegram-bot==20.8  # Replaced aiogram
+sqlalchemy==2.0.30
+asyncpg==0.29.0
+pandas==2.2.2
+aiofiles==23.2.1
+python-dotenv==1.0.1
+pytz==2024.1
+
+# Consider adding a dependency for managing database migrations (e.g., Alembic)
+# alembic==1.13.1
