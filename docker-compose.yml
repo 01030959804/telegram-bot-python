@@ -2,15 +2,13 @@ services:
   bot:
     build: .
     environment:
-      # Use `docker-compose` variables for better management
       - BOT_TOKEN=${BOT_TOKEN}
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=${DATABASE_URL}  # استخدم الـ URL من .env أو Railway
       - ADMIN_IDS=${ADMIN_IDS}
-      - TIMEZONE=Asia/Riyadh # Use a consistent timezone
+      - TIMEZONE=Africa/Cairo
       - EXPORT_DIR=/data/exports
       - RATE_LIMIT_PER_MINUTE=10
       - DEFAULT_CURRENCY=${DEFAULT_CURRENCY}
-      - MIN_WITHDRAWAL_AMOUNT=${MIN_WITHDRAWAL_AMOUNT}
     volumes:
       - export_data:/data/exports
     depends_on:
@@ -24,11 +22,12 @@ services:
   db:
     image: postgres:15
     environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=your_password  # غير ده
       - POSTGRES_DB=affiliate_db
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./migrations.sql:/docker-entrypoint-initdb.d/init.sql
 
 volumes:
   pgdata:
