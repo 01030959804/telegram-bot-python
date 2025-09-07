@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS affiliates (
     phone VARCHAR(20) NOT NULL,
     store_name VARCHAR(255) NOT NULL,
     balance NUMERIC(12, 2) DEFAULT 0.00 NOT NULL,
+    total_earnings NUMERIC(12, 2) DEFAULT 0.00 NOT NULL,  -- Added to match Python model
     total_sales NUMERIC(12, 2) DEFAULT 0.00 NOT NULL,
     total_orders INTEGER DEFAULT 0 NOT NULL
 );
@@ -14,9 +15,14 @@ CREATE TABLE IF NOT EXISTS orders (
     affiliate_id INTEGER NOT NULL,
     customer_name VARCHAR(255) NOT NULL,
     customer_phone VARCHAR(20) NOT NULL,
+    address VARCHAR(255) NOT NULL,  -- Added
     city VARCHAR(100) NOT NULL,
+    country VARCHAR(100) NOT NULL DEFAULT 'السعودية',
+    currency VARCHAR(10) NOT NULL,  -- Added
     product VARCHAR(255) NOT NULL,
-    price NUMERIC(12, 2) NOT NULL,
+    product_code VARCHAR(50),  -- Already added
+    cost_price NUMERIC(12, 2) NOT NULL,  -- Added
+    selling_price NUMERIC(12, 2) NOT NULL,  -- Added (was price?)
     commission NUMERIC(12, 2) NOT NULL,
     status VARCHAR(50) DEFAULT 'pending' NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -29,7 +35,10 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     amount NUMERIC(12, 2) NOT NULL,
     phone VARCHAR(20) NOT NULL,
     status VARCHAR(50) DEFAULT 'pending' NOT NULL,
+    currency VARCHAR(10) NOT NULL,  -- Added
     requested_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    processed_at TIMESTAMP WITH TIME ZONE,  -- Added
+    processed_by_admin_id INTEGER,  -- Added
     CONSTRAINT fk_affiliate_withdrawal FOREIGN KEY (affiliate_id) REFERENCES affiliates(id) ON DELETE CASCADE
 );
 
@@ -38,5 +47,3 @@ CREATE INDEX IF NOT EXISTS idx_affiliates_telegram_id ON affiliates (telegram_id
 CREATE INDEX IF NOT EXISTS idx_orders_affiliate_id ON orders (affiliate_id);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_affiliate_id ON withdrawals (affiliate_id);
-ALTER TABLE orders ADD COLUMN product_code VARCHAR;
-ALTER TABLE orders ADD COLUMN country VARCHAR NOT NULL DEFAULT 'السعودية';
