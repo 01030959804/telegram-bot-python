@@ -2,13 +2,15 @@ services:
   bot:
     build: .
     environment:
+      # Use `docker-compose` variables for better management
       - BOT_TOKEN=${BOT_TOKEN}
-      - DATABASE_URL=postgresql+asyncpg://user:password@db:5432/affiliate_db
+      - DATABASE_URL=${DATABASE_URL}
       - ADMIN_IDS=${ADMIN_IDS}
-      - TIMEZONE=Africa/Cairo
+      - TIMEZONE=Asia/Riyadh # Use a consistent timezone
       - EXPORT_DIR=/data/exports
       - RATE_LIMIT_PER_MINUTE=10
       - DEFAULT_CURRENCY=${DEFAULT_CURRENCY}
+      - MIN_WITHDRAWAL_AMOUNT=${MIN_WITHDRAWAL_AMOUNT}
     volumes:
       - export_data:/data/exports
     depends_on:
