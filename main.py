@@ -42,8 +42,8 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", 10))
 MIN_WITHDRAWAL_AMOUNT = float(os.getenv("MIN_WITHDRAWAL_AMOUNT", 50.0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Exchange rates to USD (as of 2025-09-04)
-SAR_TO_USD = 0.2665
+# Exchange rates to USD (as of 2025-09-07)
+SAR_TO_USD = 0.266521
 AED_TO_USD = 0.2723
 
 # Validate essential environment variables
@@ -90,8 +90,9 @@ class Order(Base):
     cost_price = Column(Float, nullable=False)  # New field for original cost price
     selling_price = Column(Float, nullable=False)  # New field for selling price
     commission = Column(Float, nullable=False)
-    status = Column(String, default="pending", nullable=False)  # pending, delivered, issue
+    status = Column(String, default="pending", nullable=False)  # pending, delivered, issue, canceled
     created_at = Column(DateTime(timezone=True), nullable=False) # Made timezone aware
+    notes = Column(String, nullable=True)  # New field for admin notes
 
     def __repr__(self):
         return f"<Order(id={self.id}, affiliate_id={self.affiliate_id}, selling_price={self.selling_price}, country={self.country})>"
@@ -167,7 +168,7 @@ def convert_to_usd(amount: float, currency: str) -> float:
 REGISTER_NAME, REGISTER_PHONE, REGISTER_STORE_NAME = range(3)
 ORDER_CUSTOMER_NAME, ORDER_CUSTOMER_PHONE, ORDER_ADDRESS, ORDER_CITY, ORDER_COUNTRY, ORDER_PRODUCT, ORDER_PRODUCT_CODE, ORDER_COST_PRICE, ORDER_SELLING_PRICE = range(3, 12)
 WITHDRAWAL_AMOUNT, WITHDRAWAL_PHONE = range(12, 14)
-ADMIN_MENU, ADMIN_WITHDRAWALS_MENU, ADMIN_ORDERS_MENU = range(14, 17)
+ADMIN_MENU, ADMIN_WITHDRAWALS_MENU, ADMIN_ORDERS_MENU, ENTER_CANCEL_NOTES = range(14, 18)
 
 # --- Rate Limiting ---
 async def rate_limit_check(affiliate_id: int) -> bool:
@@ -465,7 +466,14 @@ async def cmd_my_orders(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
         for order in orders[:10]: # Displaying last 10 orders
             usd_commission = convert_to_usd(order.commission, order.currency)
             commission_text = f"{usd_commission:.2f} USD (مؤكدة)" if order.status == "delivered" else f"{usd_commission:.2f} USD (غير مؤكدة)"
-            status_text = "تم التوصيل" if order.status == "delivered" else "في الانتظار" if order.status == "pending" else "هناك مشكلة - تواصل مع الدعم"
+            if order.status == "delivered":
+                status_text = "تم التوصيل"
+            elif order.status == "pending":
+                status_text = "في الانتظار"
+            elif order.status == "canceled":
+                status_text = "تم الإلغاء"
+            else:
+                status_text = "هناك مشكلة - تواصل مع الدعم"
             response += (
                 f"🆔 {order.id} | العميل: {order.customer_name} ({order.country})\n"
                 f"  العنوان: {order.address}, {order.city}\n"
@@ -720,7 +728,14 @@ async def handle_view_orders_callback(tg_update: Update, context: ContextTypes.D
 
         response = f"📦 طلبات المسوّق {affiliate_name} ({len(orders)}):\n\n"
         for order in orders[:20]:
-            status_text = "تم التوصيل" if order.status == "delivered" else "في الانتظار" if order.status == "pending" else "هناك مشكلة - تواصل مع الدعم"
+            if order.status == "delivered":
+                status_text = "تم التوصيل"
+            elif order.status == "pending":
+                status_text = "في الانتظار"
+            elif order.status == "canceled":
+                status_text = "تم الإلغاء"
+            else:
+                status_text = "هناك مشكلة - تواصل مع الدعم"
             response += (
                 f"🆔 {order.id} | العميل: {order.customer_name} | "
                 f"العنوان: {order.address}, {order.city} ({order.country}) | المنتج: {order.product} | "
@@ -744,7 +759,14 @@ async def cmd_all_orders_admin(tg_update: Update, context: ContextTypes.DEFAULT_
             return ADMIN_MENU
         response = f"📦 جميع الطلبات ({len(orders)}):\n\n"
         for order in orders[:20]:  # Limit to 20 for brevity
-            status_text = "تم التوصيل" if order.status == "delivered" else "في الانتظار" if order.status == "pending" else "هناك مشكلة - تواصل مع الدعم"
+            if order.status == "delivered":
+                status_text = "تم التوصيل"
+            elif order.status == "pending":
+                status_text = "في الانتظار"
+            elif order.status == "canceled":
+                status_text = "تم الإلغاء"
+            else:
+                status_text = "هناك مشكلة - تواصل مع الدعم"
             response += (
                 f"🆔 {order.id} | المسوّق ID: {order.affiliate_id} | العميل: {order.customer_name} | "
                 f"العنوان: {order.address}, {order.city} ({order.country}) | المنتج: {order.product} | "
@@ -784,7 +806,8 @@ async def show_pending_orders(tg_update: Update, context: ContextTypes.DEFAULT_T
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("تم التوصيل", callback_data=f"delivered_{order.id}"),
-                    InlineKeyboardButton("هناك مشكلة", callback_data=f"issue_{order.id}")
+                    InlineKeyboardButton("هناك مشكلة", callback_data=f"issue_{order.id}"),
+                    InlineKeyboardButton("تم الإلغاء", callback_data=f"canceled_{order.id}")
                 ]
             ])
             response = (
@@ -849,15 +872,45 @@ async def handle_order_status_callback(tg_update: Update, context: ContextTypes.
                 )
             )
             await session.commit()
+            notification = f"تم توصيل الطلب رقم {order.id} بنجاح.\nالعمولة المضافة: {usd_commission:.2f} USD"
+            await context.bot.send_message(affiliate.telegram_id, notification)
             await query.edit_message_text(f"✅ تم تأكيد توصيل الطلب رقم {order_id} بنجاح.\nتم إضافة {usd_commission:.2f} USD إلى رصيد المسوّق {affiliate.name}.", reply_markup=admin_menu())
             logger.info(f"Admin {query.from_user.id} confirmed delivery for order {order_id} for affiliate {affiliate.id}. Commission: {usd_commission:.2f} USD")
+            return ADMIN_MENU
         elif action == "issue":
             order.status = "issue"
             await session.commit()
             await query.edit_message_text(f"❌ تم وضع علامة مشكلة على الطلب رقم {order_id}.", reply_markup=admin_menu())
             logger.info(f"Admin {query.from_user.id} marked issue for order {order_id} for affiliate {affiliate.id}.")
-        
-        return ADMIN_MENU # Return to admin menu after processing
+            return ADMIN_MENU
+        elif action == "canceled":
+            context.user_data['order_id'] = order_id
+            await query.edit_message_text("أدخل الملاحظات للإلغاء (مثل: العميل رفض الاستلام):")
+            return ENTER_CANCEL_NOTES
+
+async def admin_receive_cancel_notes(tg_update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    notes = tg_update.message.text
+    order_id = context.user_data.pop('order_id', None)
+    if not order_id:
+        await tg_update.message.reply_text("خطأ في العملية.", reply_markup=admin_menu())
+        return ADMIN_MENU
+    async with SessionLocal() as session:
+        order_result = await session.execute(select(Order).where(Order.id == order_id))
+        order = order_result.scalar_one_or_none()
+        if order:
+            order.status = "canceled"
+            order.notes = notes
+            await session.commit()
+            affiliate_result = await session.execute(select(Affiliate).where(Affiliate.id == order.affiliate_id))
+            affiliate = affiliate_result.scalar_one_or_none()
+            if affiliate:
+                notification = f"تم إلغاء الطلب رقم {order.id}.\nالملاحظات: {notes}"
+                await context.bot.send_message(affiliate.telegram_id, notification)
+            await tg_update.message.reply_text("تم إلغاء الطلب وإرسال الإشعار.", reply_markup=admin_menu())
+            logger.info(f"Admin canceled order {order_id} with notes: {notes}")
+        else:
+            await tg_update.message.reply_text("الطلب غير موجود.", reply_markup=admin_menu())
+    return ADMIN_MENU
 
 async def admin_manage_withdrawals(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tg_update.effective_user.id not in ADMIN_IDS:
@@ -1072,9 +1125,12 @@ admin_conv_handler = ConversationHandler(
             MessageHandler(filters.TEXT, admin_manage_withdrawals) # If admin sends text while in withdrawals menu, re-show withdrawals
         ],
         ADMIN_ORDERS_MENU: [
-            CallbackQueryHandler(handle_order_status_callback, pattern="^(delivered|issue)_(\\d+)$"),
+            CallbackQueryHandler(handle_order_status_callback, pattern="^(delivered|issue|canceled)_(\\d+)$"),
             MessageHandler(filters.Regex("^🔙 العودة إلى القائمة الرئيسية$"), cmd_back_to_main_menu),
             MessageHandler(filters.TEXT, admin_manage_orders) # If admin sends text while in orders menu, re-show orders
+        ],
+        ENTER_CANCEL_NOTES: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_cancel_notes),
         ]
     },
     fallbacks=[CommandHandler("cancel", cancel_conversation), MessageHandler(filters.Regex("^🔙 العودة إلى القائمة الرئيسية$"), cmd_back_to_main_menu)],
