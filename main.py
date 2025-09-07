@@ -3,14 +3,14 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 import pytz
+import zipfile
 import re
 import pandas as pd
 
 # Third-party libraries
-from sqlalchemy import Column, Integer, String, Float, DateTime, select, update, func, label
+from sqlalchemy import Column, Integer, String, Float, DateTime, select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.sql import Select
 from dotenv import load_dotenv
 
 # Import from python-telegram-bot
@@ -39,7 +39,7 @@ TIMEZONE = os.getenv("TIMEZONE", "Africa/Cairo") # Changed to a common TZ for be
 EXPORT_DIR = os.getenv("EXPORT_DIR", "/app/exports")
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", 10))
 # DEFAULT_CURRENCY removed as it will be dynamic
-MIN_WITHDRAWAL_AMOUNT = float(os.getenv("MIN_WITHDRAWAL_AMOUNT", 50.0))
+MIN_WITHDRAWAL_AMOUNT = float(os.getenv("MIN_WITHDRAWAL_AMOUNT", 10.0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Exchange rates to USD (as of 2025-09-04)
@@ -68,7 +68,6 @@ class Affiliate(Base):
     phone = Column(String, nullable=False) # Egyptian phone
     store_name = Column(String, nullable=False)
     balance = Column(Float, default=0.0, nullable=False)  # Balance in USD
-    total_earnings = Column(Float, default=0.0, nullable=False)  # Total commissions earned in USD
     total_sales = Column(Float, default=0.0, nullable=False)  # Total sales in USD
     total_orders = Column(Integer, default=0, nullable=False)
 
@@ -90,7 +89,7 @@ class Order(Base):
     cost_price = Column(Float, nullable=False)  # New field for original cost price
     selling_price = Column(Float, nullable=False)  # New field for selling price
     commission = Column(Float, nullable=False)
-    status = Column(String, default="pending", nullable=False)  # pending, delivered, issue
+    status = Column(String, default="pending", nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False) # Made timezone aware
 
     def __repr__(self):
@@ -167,7 +166,7 @@ def convert_to_usd(amount: float, currency: str) -> float:
 REGISTER_NAME, REGISTER_PHONE, REGISTER_STORE_NAME = range(3)
 ORDER_CUSTOMER_NAME, ORDER_CUSTOMER_PHONE, ORDER_ADDRESS, ORDER_CITY, ORDER_COUNTRY, ORDER_PRODUCT, ORDER_PRODUCT_CODE, ORDER_COST_PRICE, ORDER_SELLING_PRICE = range(3, 12)
 WITHDRAWAL_AMOUNT, WITHDRAWAL_PHONE = range(12, 14)
-ADMIN_MENU, ADMIN_WITHDRAWALS_MENU, ADMIN_ORDERS_MENU = range(14, 17)
+ADMIN_MENU, ADMIN_WITHDRAWALS_MENU = range(14, 16)
 
 # --- Rate Limiting ---
 async def rate_limit_check(affiliate_id: int) -> bool:
@@ -202,9 +201,8 @@ def admin_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("📊 إحصاءات المسوّقين")],
             [KeyboardButton("📦 عرض جميع الطلبات")],
-            [KeyboardButton("🛠 إدارة الطلبات")],
             [KeyboardButton("💵 إدارة طلبات السحب")],
-            [KeyboardButton("📁 تصدير شامل (Excel)")],
+            [KeyboardButton("📁 تصدير شامل (ZIP)")],
             [KeyboardButton("🔙 العودة إلى القائمة الرئيسية")]
         ],
         resize_keyboard=True,
@@ -405,6 +403,8 @@ async def order_selling_price(tg_update: Update, context: ContextTypes.DEFAULT_T
     product_code = context.user_data.get('order_product_code')
     
     commission = selling_price - context.user_data['order_cost_price']
+    usd_commission = convert_to_usd(commission, currency)
+    usd_selling_price = convert_to_usd(selling_price, currency)
     async with SessionLocal() as session:
         try:
             result = await session.execute(select(Affiliate).where(Affiliate.id == affiliate_id))
@@ -434,12 +434,14 @@ async def order_selling_price(tg_update: Update, context: ContextTypes.DEFAULT_T
                 update(Affiliate)
                 .where(Affiliate.id == affiliate.id)
                 .values(
+                    balance=Affiliate.balance + usd_commission,
+                    total_sales=Affiliate.total_sales + usd_selling_price,
                     total_orders=Affiliate.total_orders + 1
                 )
             )
             await session.commit()
-            await tg_update.message.reply_text(f"تم تسجيل الطلب بنجاح! العمولة المحتملة: {convert_to_usd(commission, currency):.2f} USD (سيتم إضافتها بعد التأكيد)", reply_markup=main_menu())
-            logger.info(f"Order created by {affiliate.name} (ID: {affiliate.id}). Order ID: {order.id}")
+            await tg_update.message.reply_text(f"تم تسجيل الطلب بنجاح! العمولة: {usd_commission:.2f} USD (محولة من {commission:.2f} {currency})", reply_markup=main_menu())
+            logger.info(f"Order created by {affiliate.name} (ID: {affiliate.id}). Order ID: {order.id}, Commission: {usd_commission:.2f} USD")
         except Exception as e:
             await session.rollback()
             logger.error(f"Error creating order for {tg_update.effective_user.id}: {e}", exc_info=True)
@@ -463,16 +465,13 @@ async def cmd_my_orders(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         response = f"📦 طلباتك السابقة ({len(orders)}):\n\n"
         for order in orders[:10]: # Displaying last 10 orders
-            usd_commission = convert_to_usd(order.commission, order.currency)
-            commission_text = f"{usd_commission:.2f} USD (مؤكدة)" if order.status == "delivered" else f"{usd_commission:.2f} USD (غير مؤكدة)"
-            status_text = "تم التوصيل" if order.status == "delivered" else "في الانتظار" if order.status == "pending" else "هناك مشكلة - تواصل مع الدعم"
             response += (
                 f"🆔 {order.id} | العميل: {order.customer_name} ({order.country})\n"
                 f"  العنوان: {order.address}, {order.city}\n"
                 f"  المنتج: {order.product} | كود المنتج: {order.product_code}\n"
                 f"  سعر الأصلي: {order.cost_price:.2f} {order.currency} | سعر البيع: {order.selling_price:.2f} {order.currency}\n"
-                f"  العمولة: {commission_text}\n"
-                f"  الحالة: {status_text} | التاريخ: {order.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"  العمولة: {convert_to_usd(order.commission, order.currency):.2f} USD\n"
+                f"  الحالة: {order.status} | التاريخ: {order.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
             )
         if len(orders) > 10:
             response += "... والمزيد من الطلبات. يرجى التواصل مع الدعم للحصول على سجل كامل."
@@ -615,7 +614,6 @@ async def cmd_balance(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"الاسم: {affiliate.name}\n"
             f"المتجر: {affiliate.store_name}\n"
             f"الرصيد الحالي: {affiliate.balance:.2f} USD\n" # Assuming affiliate balance is always USD
-            f"إجمالي العمولات: {affiliate.total_earnings:.2f} USD\n"
             f"إجمالي المبيعات: {affiliate.total_sales:.2f} USD\n"
             f"عدد الطلبات: {affiliate.total_orders}\n\n"
         )
@@ -656,25 +654,14 @@ async def cmd_stats(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
             await tg_update.message.reply_text("لا يوجد مسوّقين مسجلين حتى الآن.", reply_markup=admin_menu())
             return ADMIN_MENU
 
+        response = "📊 إحصاءات المسوّقين:\n\n"
         for affiliate in affiliates:
-            delivered_count = await session.execute(
-                select(func.count()).select_from(Order).where(Order.affiliate_id == affiliate.id, Order.status == "delivered")
-            )
-            delivered_count = delivered_count.scalar_one()
-
-            response = (
+            response += (
                 f"👤 {affiliate.name} ({affiliate.store_name})\n"
                 f"  رصيد: {affiliate.balance:.2f} USD\n"
-                f"  إجمالي العمولات: {affiliate.total_earnings:.2f} USD\n"
                 f"  مبيعات: {affiliate.total_sales:.2f} USD\n"
-                f"  طلبات كلية: {affiliate.total_orders}\n"
-                f"  طلبات مكتملة: {delivered_count}\n\n"
+                f"  طلبات: {affiliate.total_orders}\n\n"
             )
-            
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("عرض الطلبات", callback_data=f"view_orders_{affiliate.id}")]
-            ])
-            await tg_update.message.reply_text(response, reply_markup=keyboard)
         
         # Add recent pending withdrawals for admin overview
         pending_withdrawals = await session.execute(
@@ -685,52 +672,15 @@ async def cmd_stats(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
         recent_pending_withdrawals = pending_withdrawals.scalars().all()
 
         if recent_pending_withdrawals:
-            response = "\n\n💵 آخر 5 طلبات سحب معلقة:\n"
+            response += "\n\n💵 آخر 5 طلبات سحب معلقة:\n"
             for w in recent_pending_withdrawals:
                 # Fetch affiliate name for each withdrawal
                 affiliate_name_res = await session.execute(select(Affiliate.name).where(Affiliate.id == w.affiliate_id))
                 affiliate_name = affiliate_name_res.scalar_one_or_none()
                 response += f"- المسوّق: {affiliate_name or 'غير معروف'} | مبلغ: {w.amount:.2f} {w.currency} | هاتف: {w.phone}\n"
-            await tg_update.message.reply_text(response)
         
-        await tg_update.message.reply_text("انتهت إحصاءات المسوّقين.", reply_markup=admin_menu())
+        await tg_update.message.reply_text(response, reply_markup=admin_menu())
         return ADMIN_MENU
-
-async def handle_view_orders_callback(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = tg_update.callback_query
-    await query.answer()
-
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("غير مصرح لك بتنفيذ هذا الإجراء.")
-        return ADMIN_MENU
-
-    aff_id = int(query.data.split("_")[2])
-    async with SessionLocal() as session:
-        affiliate_res = await session.execute(select(Affiliate.name).where(Affiliate.id == aff_id))
-        affiliate_name = affiliate_res.scalar_one_or_none()
-        if not affiliate_name:
-            await query.message.reply_text("لم يتم العثور على المسوّق.", reply_markup=admin_menu())
-            return ADMIN_MENU
-
-        orders_res = await session.execute(select(Order).where(Order.affiliate_id == aff_id).order_by(Order.created_at.desc()))
-        orders = orders_res.scalars().all()
-        if not orders:
-            await query.message.reply_text(f"لا توجد طلبات للمسوّق {affiliate_name}.", reply_markup=admin_menu())
-            return ADMIN_MENU
-
-        response = f"📦 طلبات المسوّق {affiliate_name} ({len(orders)}):\n\n"
-        for order in orders[:20]:
-            status_text = "تم التوصيل" if order.status == "delivered" else "في الانتظار" if order.status == "pending" else "هناك مشكلة - تواصل مع الدعم"
-            response += (
-                f"🆔 {order.id} | العميل: {order.customer_name} | "
-                f"العنوان: {order.address}, {order.city} ({order.country}) | المنتج: {order.product} | "
-                f"كود: {order.product_code} | الأصلي: {order.cost_price:.2f} {order.currency} | البيع: {order.selling_price:.2f} {order.currency}\n"
-                f"  الحالة: {status_text}\n"
-            )
-        if len(orders) > 20:
-            response += "\n... والمزيد."
-        await query.message.reply_text(response, reply_markup=admin_menu())
-    return ADMIN_MENU
 
 async def cmd_all_orders_admin(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tg_update.effective_user.id not in ADMIN_IDS:
@@ -744,120 +694,15 @@ async def cmd_all_orders_admin(tg_update: Update, context: ContextTypes.DEFAULT_
             return ADMIN_MENU
         response = f"📦 جميع الطلبات ({len(orders)}):\n\n"
         for order in orders[:20]:  # Limit to 20 for brevity
-            status_text = "تم التوصيل" if order.status == "delivered" else "في الانتظار" if order.status == "pending" else "هناك مشكلة - تواصل مع الدعم"
             response += (
                 f"🆔 {order.id} | المسوّق ID: {order.affiliate_id} | العميل: {order.customer_name} | "
                 f"العنوان: {order.address}, {order.city} ({order.country}) | المنتج: {order.product} | "
                 f"كود: {order.product_code} | الأصلي: {order.cost_price:.2f} {order.currency} | البيع: {order.selling_price:.2f} {order.currency}\n"
-                f"  الحالة: {status_text}\n"
             )
         if len(orders) > 20:
             response += "\n... والمزيد."
         await tg_update.message.reply_text(response, reply_markup=admin_menu())
         return ADMIN_MENU
-
-async def admin_manage_orders(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if tg_update.effective_user.id not in ADMIN_IDS:
-        await tg_update.message.reply_text("غير مصرح لك باستخدام هذا الأمر.")
-        return ConversationHandler.END
-    
-    await show_pending_orders(tg_update, context)
-    return ADMIN_ORDERS_MENU
-
-async def show_pending_orders(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with SessionLocal() as session:
-        pending_orders = await session.execute(
-            select(Order).where(Order.status == "pending").order_by(Order.created_at.asc())
-        )
-        orders = pending_orders.scalars().all()
-
-        if not orders:
-            await tg_update.effective_message.reply_text("لا توجد طلبات معلقة حالياً.", reply_markup=admin_menu())
-            return ConversationHandler.END # If no orders, go back to admin menu
-        
-        response = "🛠 طلبات الطلبات المعلقة:\n\n"
-        for order in orders:
-            affiliate_res = await session.execute(select(Affiliate).where(Affiliate.id == order.affiliate_id))
-            affiliate = affiliate_res.scalar_one_or_none()
-            affiliate_name = affiliate.name if affiliate else "غير معروف"
-
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("تم التوصيل", callback_data=f"delivered_{order.id}"),
-                    InlineKeyboardButton("هناك مشكلة", callback_data=f"issue_{order.id}")
-                ]
-            ])
-            response = (
-                f"----------------------------------------\n"
-                f"🆔 طلب #{order.id}\n"
-                f"  المسوّق: {affiliate_name}\n"
-                f"  العميل: {order.customer_name} | هاتف: {order.customer_phone}\n"
-                f"  العنوان: {order.address}, {order.city} ({order.country})\n"
-                f"  المنتج: {order.product} | كود: {order.product_code}\n"
-                f"  سعر الأصلي: {order.cost_price:.2f} {order.currency} | سعر البيع: {order.selling_price:.2f} {order.currency}\n"
-                f"  العمولة المحتملة: {convert_to_usd(order.commission, order.currency):.2f} USD\n"
-                f"  تاريخ الطلب: {order.created_at.strftime('%Y-%m-%d %H:%M')}\n"
-                f"----------------------------------------\n"
-            )
-            await tg_update.effective_message.reply_text(response, reply_markup=keyboard)
-
-        await tg_update.effective_message.reply_text("انتهت قائمة الطلبات المعلقة. اختر من القائمة:", reply_markup=admin_menu())
-        return ADMIN_ORDERS_MENU
-
-async def handle_order_status_callback(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = tg_update.callback_query
-    await query.answer() # Acknowledge the callback
-
-    if query.from_user.id not in ADMIN_IDS:
-        await query.edit_message_text("غير مصرح لك بتنفيذ هذا الإجراء.")
-        return
-
-    action, order_id = query.data.split('_')
-    order_id = int(order_id)
-
-    async with SessionLocal() as session:
-        order_res = await session.execute(select(Order).where(Order.id == order_id))
-        order = order_res.scalar_one_or_none()
-
-        if not order:
-            await query.edit_message_text(f"خطأ: لم يتم العثور على الطلب رقم {order_id}.", reply_markup=admin_menu())
-            return ADMIN_MENU
-        
-        if order.status != "pending":
-            await query.edit_message_text(f"الطلب رقم {order_id} تمت معالجته بالفعل ({order.status}).", reply_markup=admin_menu())
-            return ADMIN_MENU
-
-        affiliate_res = await session.execute(select(Affiliate).where(Affiliate.id == order.affiliate_id))
-        affiliate = affiliate_res.scalar_one_or_none()
-        
-        if not affiliate:
-            await query.edit_message_text(f"خطأ: لم يتم العثور على المسوّق للطلب رقم {order_id}.", reply_markup=admin_menu())
-            return ADMIN_MENU
-
-        usd_commission = convert_to_usd(order.commission, order.currency)
-        usd_selling_price = convert_to_usd(order.selling_price, order.currency)
-
-        if action == "delivered":
-            order.status = "delivered"
-            await session.execute(
-                update(Affiliate)
-                .where(Affiliate.id == affiliate.id)
-                .values(
-                    balance=Affiliate.balance + usd_commission,
-                    total_earnings=Affiliate.total_earnings + usd_commission,
-                    total_sales=Affiliate.total_sales + usd_selling_price
-                )
-            )
-            await session.commit()
-            await query.edit_message_text(f"✅ تم تأكيد توصيل الطلب رقم {order_id} بنجاح.\nتم إضافة {usd_commission:.2f} USD إلى رصيد المسوّق {affiliate.name}.", reply_markup=admin_menu())
-            logger.info(f"Admin {query.from_user.id} confirmed delivery for order {order_id} for affiliate {affiliate.id}. Commission: {usd_commission:.2f} USD")
-        elif action == "issue":
-            order.status = "issue"
-            await session.commit()
-            await query.edit_message_text(f"❌ تم وضع علامة مشكلة على الطلب رقم {order_id}.", reply_markup=admin_menu())
-            logger.info(f"Admin {query.from_user.id} marked issue for order {order_id} for affiliate {affiliate.id}.")
-        
-        return ADMIN_MENU # Return to admin menu after processing
 
 async def admin_manage_withdrawals(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tg_update.effective_user.id not in ADMIN_IDS:
@@ -890,7 +735,7 @@ async def show_pending_withdrawals(tg_update: Update, context: ContextTypes.DEFA
                     InlineKeyboardButton("❌ رفض", callback_data=f"reject_{w.id}")
                 ]
             ])
-            response = (
+            response += (
                 f"----------------------------------------\n"
                 f"🆔 طلب سحب #{w.id}\n"
                 f"  المسوّق: {affiliate_name}\n"
@@ -900,9 +745,10 @@ async def show_pending_withdrawals(tg_update: Update, context: ContextTypes.DEFA
                 f"----------------------------------------\n"
             )
             await tg_update.effective_message.reply_text(response, reply_markup=keyboard)
+            response = "" # Clear response after sending each one
 
         await tg_update.effective_message.reply_text("انتهت قائمة طلبات السحب المعلقة. اختر من القائمة:", reply_markup=admin_menu())
-        return ADMIN_WITHDRAWALS_MENU
+        return ADMIN_MENU # After showing all, return to admin menu
 
 async def handle_withdrawal_callback(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = tg_update.callback_query
@@ -972,42 +818,53 @@ async def cmd_export(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await tg_update.message.reply_text("جاري إعداد ملف التصدير، يرجى الانتظار...")
 
-    excel_path = None
+    affiliates_csv = orders_csv = withdrawals_csv = None
+    zip_path = None
     try:
         # Use a synchronous connection for pandas read_sql_query
         async with engine.connect() as conn:
             # Need to get a sync connection from the async one
             sync_conn = await conn.get_sync_connection()
             affiliates_df = pd.read_sql_query(select(Affiliate).statement, sync_conn)
-            
-            orders_query: Select = select(Order.__table__.c, label("affiliate_name", Affiliate.name)).join(Affiliate, Order.affiliate_id == Affiliate.id)
-            orders_df = pd.read_sql_query(orders_query, sync_conn)
-            
-            withdrawals_query: Select = select(Withdrawal.__table__.c, label("affiliate_name", Affiliate.name)).join(Affiliate, Withdrawal.affiliate_id == Affiliate.id)
-            withdrawals_df = pd.read_sql_query(withdrawals_query, sync_conn)
+            orders_df = pd.read_sql_query(select(Order).statement, sync_conn)
+            withdrawals_df = pd.read_sql_query(select(Withdrawal).statement, sync_conn)
 
         timestamp = get_now_timezone_aware().strftime("%Y%m%d_%H%M%S")
-        export_filename = f"export_{timestamp}.xlsx"
-        excel_path = os.path.join(EXPORT_DIR, export_filename)
+        zip_filename = f"export_{timestamp}.zip"
+        zip_path = os.path.join(EXPORT_DIR, zip_filename)
 
-        with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
-            affiliates_df.to_excel(writer, sheet_name='Affiliates', index=False)
-            orders_df.to_excel(writer, sheet_name='Orders', index=False)
-            withdrawals_df.to_excel(writer, sheet_name='Withdrawals', index=False)
+        affiliates_csv = os.path.join(EXPORT_DIR, f"affiliates_{timestamp}.csv")
+        orders_csv = os.path.join(EXPORT_DIR, f"orders_{timestamp}.csv")
+        withdrawals_csv = os.path.join(EXPORT_DIR, f"withdrawals_{timestamp}.csv")
 
-        with open(excel_path, 'rb') as f:
-            await tg_update.message.reply_document(document=f, filename=export_filename)
-        logger.info(f"Exported data to {export_filename} for admin {tg_update.effective_user.id}")
+        affiliates_df.to_csv(affiliates_csv, index=False, encoding='utf-8-sig')
+        orders_df.to_csv(orders_csv, index=False, encoding='utf-8-sig')
+        withdrawals_df.to_csv(withdrawals_csv, index=False, encoding='utf-8-sig')
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(affiliates_csv, "affiliates.csv")
+            zipf.write(orders_csv, "orders.csv")
+            zipf.write(withdrawals_csv, "withdrawals.csv")
+
+        with open(zip_path, 'rb') as f:
+            await tg_update.message.reply_document(document=f, filename=zip_filename)
+        logger.info(f"Exported data to {zip_filename} for admin {tg_update.effective_user.id}")
 
     except Exception as e:
         logger.error(f"Error during export for admin {tg_update.effective_user.id}: {e}", exc_info=True)
         await tg_update.message.reply_text("حدث خطأ أثناء عملية التصدير. يرجى المحاولة مرة أخرى لاحقًا.", reply_markup=admin_menu())
     finally:
-        if excel_path and os.path.exists(excel_path):
+        for file in [affiliates_csv, orders_csv, withdrawals_csv]:
+            if file and os.path.exists(file):
+                try:
+                    os.remove(file)
+                except OSError as e:
+                    logger.warning(f"Error removing temporary file {file}: {e}")
+        if zip_path and os.path.exists(zip_path):
             try:
-                os.remove(excel_path)
+                os.remove(zip_path)
             except OSError as e:
-                logger.warning(f"Error removing excel file {excel_path}: {e}")
+                logger.warning(f"Error removing zip file {zip_path}: {e}")
         return ADMIN_MENU # Return to admin menu
 
 async def cmd_back_to_main_menu(tg_update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1060,21 +917,14 @@ admin_conv_handler = ConversationHandler(
         ADMIN_MENU: [
             MessageHandler(filters.Regex("^📊 إحصاءات المسوّقين$"), cmd_stats),
             MessageHandler(filters.Regex("^📦 عرض جميع الطلبات$"), cmd_all_orders_admin),
-            MessageHandler(filters.Regex("^🛠 إدارة الطلبات$"), admin_manage_orders),
             MessageHandler(filters.Regex("^💵 إدارة طلبات السحب$"), admin_manage_withdrawals),
-            MessageHandler(filters.Regex("^📁 تصدير شامل \\(Excel\\)$"), cmd_export),
+            MessageHandler(filters.Regex("^📁 تصدير شامل \\(ZIP\\)$"), cmd_export),
             MessageHandler(filters.Regex("^🔙 العودة إلى القائمة الرئيسية$"), cmd_back_to_main_menu),
-            CallbackQueryHandler(handle_view_orders_callback, pattern="^view_orders_(\\d+)$")
         ],
         ADMIN_WITHDRAWALS_MENU: [
-            CallbackQueryHandler(handle_withdrawal_callback, pattern="^(approve|reject)_(\\d+)$"),
+            CallbackQueryHandler(handle_withdrawal_callback, pattern="^(approve|reject)_(\d+)$"),
             MessageHandler(filters.Regex("^🔙 العودة إلى القائمة الرئيسية$"), cmd_back_to_main_menu),
             MessageHandler(filters.TEXT, admin_manage_withdrawals) # If admin sends text while in withdrawals menu, re-show withdrawals
-        ],
-        ADMIN_ORDERS_MENU: [
-            CallbackQueryHandler(handle_order_status_callback, pattern="^(delivered|issue)_(\\d+)$"),
-            MessageHandler(filters.Regex("^🔙 العودة إلى القائمة الرئيسية$"), cmd_back_to_main_menu),
-            MessageHandler(filters.TEXT, admin_manage_orders) # If admin sends text while in orders menu, re-show orders
         ]
     },
     fallbacks=[CommandHandler("cancel", cancel_conversation), MessageHandler(filters.Regex("^🔙 العودة إلى القائمة الرئيسية$"), cmd_back_to_main_menu)],
